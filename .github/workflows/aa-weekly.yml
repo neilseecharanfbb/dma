@@ -5,7 +5,7 @@ on:
     # Dual cron so it always aligns with 10:00 AM America/New_York across DST shifts.
     - cron: '0 14 * * 1'  # 10:00 ET during Daylight Time (UTC-4)
     - cron: '0 15 * * 1'  # 10:00 ET during Standard Time (UTC-5)
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 jobs:
   weekly-report:
@@ -16,7 +16,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Guard: run only if it's 10:00 in America/New_York
+      - name: "Guard - run only if it's 10:00 in America/New_York"
         id: guard
         run: |
           python - <<'PY'
@@ -41,7 +41,7 @@ jobs:
         if: steps.guard.outputs.RUN == 'yes'
         run: pip install -r requirements.txt
 
-      - name: Compute prior Sunday→Saturday window (America/New_York)
+      - name: "Compute prior Sunday to Saturday window (America/New_York)"
         if: steps.guard.outputs.RUN == 'yes'
         id: week
         run: |
@@ -65,7 +65,7 @@ jobs:
               f.write(f"CACHE_KEY=aa-cache-{start}_to_{end}\n")
           PY
 
-      - name: Cache AA pages (resumable across runs)
+      - name: Cache AA pages (resumable)
         if: steps.guard.outputs.RUN == 'yes'
         uses: actions/cache@v4
         with:
@@ -83,16 +83,14 @@ jobs:
           AA_API_KEY: ${{ secrets.AA_API_KEY }}
           AA_ORG_ID: ${{ secrets.AA_ORG_ID }}
           AA_COMPANY_ID: ${{ secrets.AA_COMPANY_ID }}
-          # Optional override:
-          # BRAND_RSIDS: vrs_ospgro1_womanwithin
           START_DATE: ${{ steps.week.outputs.START_ISO }}
           END_DATE: ${{ steps.week.outputs.END_ISO }}
           # ---- FTP (Adobe Omniture) ----
           FTP_HOST: ftp.omniture.com
           FTP_USER: ${{ secrets.FTP_USER }}
           FTP_PASS: ${{ secrets.FTP_PASS }}
-          FTP_DIR: "/"         # change if you want a subfolder, e.g., /incoming
-          FTP_TLS: "true"      # try FTPS first; falls back to plain FTP
+          FTP_DIR: "/"
+          FTP_TLS: "true"
         run: |
           python aa_dma_by_segment.py
 
@@ -102,7 +100,7 @@ jobs:
         run: |
           echo "FILE_PATH=$(cat output/latest.txt)" >> $GITHUB_OUTPUT
 
-      - name: Upload artifact (for records)
+      - name: Upload artifact
         if: steps.guard.outputs.RUN == 'yes'
         uses: actions/upload-artifact@v4
         with:
