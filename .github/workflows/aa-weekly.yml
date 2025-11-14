@@ -1,0 +1,110 @@
+name: Adobe AA Weekly DMA Report (FTP only)
+
+on:
+  schedule:
+    # Dual cron so it always aligns with 10:00 AM America/New_York across DST shifts.
+    - cron: '0 14 * * 1'  # 10:00 ET during Daylight Time (UTC-4)
+    - cron: '0 15 * * 1'  # 10:00 ET during Standard Time (UTC-5)
+  workflow_dispatch: {}
+
+jobs:
+  weekly-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Guard: run only if it's 10:00 in America/New_York
+        id: guard
+        run: |
+          python - <<'PY'
+          import os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          now = datetime.now(ZoneInfo("America/New_York"))
+          print("Current ET:", now.isoformat())
+          run = 'yes' if (now.hour == 10) else 'no'
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              f.write(f"RUN={run}\n")
+          PY
+
+      - name: Set up Python
+        if: steps.guard.outputs.RUN == 'yes'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install deps
+        if: steps.guard.outputs.RUN == 'yes'
+        run: pip install -r requirements.txt
+
+      - name: Compute prior Sunday→Saturday window (America/New_York)
+        if: steps.guard.outputs.RUN == 'yes'
+        id: week
+        run: |
+          python - <<'PY'
+          import os
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
+          tz = ZoneInfo("America/New_York")
+          now = datetime.now(tz)
+          days_since_sunday = (now.weekday() + 1) % 7
+          last_sunday = (now - timedelta(days=days_since_sunday)).date()
+          start = last_sunday - timedelta(days=7)  # prior Sunday
+          end = last_sunday                        # exclusive end
+          start_iso = f"{start}T00:00:00.000"
+          end_iso = f"{end}T00:00:00.000"
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"START_ISO={start_iso}\n")
+              f.write(f"END_ISO={end_iso}\n")
+              f.write(f"START_DATE={start}\n")
+              f.write(f"END_DATE={end}\n")
+              f.write(f"CACHE_KEY=aa-cache-{start}_to_{end}\n")
+          PY
+
+      - name: Cache AA pages (resumable across runs)
+        if: steps.guard.outputs.RUN == 'yes'
+        uses: actions/cache@v4
+        with:
+          path: .aa_cache
+          key: ${{ steps.week.outputs.CACHE_KEY }}
+          restore-keys: |
+            aa-cache-
+
+      - name: Run report (and upload to FTP)
+        if: steps.guard.outputs.RUN == 'yes'
+        env:
+          # ---- Adobe ----
+          AA_CLIENT_ID: ${{ secrets.AA_CLIENT_ID }}
+          AA_CLIENT_SECRET: ${{ secrets.AA_CLIENT_SECRET }}
+          AA_API_KEY: ${{ secrets.AA_API_KEY }}
+          AA_ORG_ID: ${{ secrets.AA_ORG_ID }}
+          AA_COMPANY_ID: ${{ secrets.AA_COMPANY_ID }}
+          # Optional override:
+          # BRAND_RSIDS: vrs_ospgro1_womanwithin
+          START_DATE: ${{ steps.week.outputs.START_ISO }}
+          END_DATE: ${{ steps.week.outputs.END_ISO }}
+          # ---- FTP (Adobe Omniture) ----
+          FTP_HOST: ftp.omniture.com
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+          FTP_DIR: "/"         # change if you want a subfolder, e.g., /incoming
+          FTP_TLS: "true"      # try FTPS first; falls back to plain FTP
+        run: |
+          python aa_dma_by_segment.py
+
+      - name: Get output path
+        if: steps.guard.outputs.RUN == 'yes'
+        id: out
+        run: |
+          echo "FILE_PATH=$(cat output/latest.txt)" >> $GITHUB_OUTPUT
+
+      - name: Upload artifact (for records)
+        if: steps.guard.outputs.RUN == 'yes'
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-aa-report-${{ steps.week.outputs.START_DATE }}_to_${{ steps.week.outputs.END_DATE }}
+          path: ${{ steps.out.outputs.FILE_PATH }}
