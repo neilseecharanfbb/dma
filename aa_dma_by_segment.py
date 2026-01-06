@@ -3,18 +3,22 @@
 
 """
 Adobe Analytics API 2.0 - Weekly DMA x Last Touch Channel (Segments) per RSID
+KS-aligned behavior:
+- ONE weekly XLSX file
+- Data is pulled per DAY (Date column is YYYY-MM-DD)
+- File name pattern matches KS:
+    adobe_dma_by_segment_KS_<weekStartYYYY-MM-DD>_to_<weekEndYYYY-MM-DD>.xlsx
+  where weekEnd is SATURDAY (inclusive)
 - Fast via ThreadPoolExecutor
-- Resumable per-page cache: .aa_cache/<rsid>/<segment_id>/page_XXXXX.json
-- Progress bars for brands, segments, pages
+- Resumable per-page cache (day-specific):
+    .aa_cache/<rsid>/<segment_id>/<YYYY-MM-DD>/page_XXXXX.json
 - Excel output (one sheet per RSID) with columns:
   Date, DMA, Last_Touch_Channel, Visits, Orders, Demand, NMA, NTF
 
-The script:
+Date behavior:
 - Uses START_DATE/END_DATE from env if provided (ISO 8601 with ms),
-  otherwise auto-computes the prior Sunday->Saturday in America/New_York.
-- Writes: output/adobe_dma_by_segment_<start>_to_<end>.xlsx
-- Writes output path to: output/latest.txt (picked up by the workflow)
-- Uploads the file to FTP/FTPS when FTP_* env vars are set (configured in the workflow).
+  otherwise auto-computes the prior Sunday->Sunday (exclusive) in America/New_York.
+- Expands that range into individual days and queries each day separately.
 """
 
 import os
@@ -25,7 +29,7 @@ import ftplib
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 import requests
 import pandas as pd
@@ -34,6 +38,7 @@ try:
     from zoneinfo import ZoneInfo
 except ImportError:
     from backports.zoneinfo import ZoneInfo  # for older Python if needed
+
 
 # ================== Config (env-driven in GitHub Actions) ==================
 
@@ -111,7 +116,7 @@ FTP_TLS  = os.environ.get("FTP_TLS", "true").lower() in {"1", "true", "yes"}  # 
 
 def prior_week_sun_to_sun_iso() -> Tuple[str, str, str, str]:
     """
-    Compute prior Sunday->Saturday as an AA dateRange:
+    Compute prior Sunday->Sunday (exclusive) as an AA dateRange:
     start = prior Sunday 00:00:00.000
     end   = last Sunday  00:00:00.000 (exclusive)
     Return (start_iso, end_iso, start_date_str, end_date_str)
@@ -127,12 +132,34 @@ def prior_week_sun_to_sun_iso() -> Tuple[str, str, str, str]:
     end_iso = f"{end}T00:00:00.000"
     return start_iso, end_iso, str(start), str(end)
 
+def iso_to_date(iso_str: str) -> date:
+    return date.fromisoformat(iso_str[:10])
+
+def iter_days(start_d: date, end_d_exclusive: date) -> List[Tuple[str, str, str]]:
+    """
+    Returns list of (day_start_iso, day_end_iso, day_label_YYYY-MM-DD)
+    for each day in [start_d, end_d_exclusive).
+    """
+    days: List[Tuple[str, str, str]] = []
+    cur = start_d
+    while cur < end_d_exclusive:
+        nxt = cur + timedelta(days=1)
+        days.append((f"{cur}T00:00:00.000", f"{nxt}T00:00:00.000", str(cur)))
+        cur = nxt
+    return days
+
 START_DATE = os.environ.get("START_DATE")
 END_DATE = os.environ.get("END_DATE")
+
 if not START_DATE or not END_DATE:
     START_DATE, END_DATE, START_D, END_D = prior_week_sun_to_sun_iso()
 else:
     START_D, END_D = START_DATE[:10], END_DATE[:10]
+
+START_DATE_D = iso_to_date(START_DATE)
+END_DATE_D_EXCL = iso_to_date(END_DATE)
+
+DAY_RANGES = iter_days(START_DATE_D, END_DATE_D_EXCL)  # [(day_start_iso, day_end_iso, day_label), ...]
 
 
 # ================== Token Manager (thread-safe) ==================
@@ -186,15 +213,14 @@ def build_headers(token: str) -> Dict[str, str]:
 # ================== Request / parse helpers ==================
 
 def clean_channel_name(name_with_ww: str) -> str:
-    # Remove "(WW)" with any extra spaces
     return name_with_ww.replace(" (WW)", "").replace("  (WW)", "").strip()
 
-def build_payload(rsid: str, segment_id: str, page: int, limit: int) -> Dict[str, Any]:
+def build_payload(rsid: str, segment_id: str, page: int, limit: int, day_start_iso: str, day_end_iso: str) -> Dict[str, Any]:
     return {
         "rsid": rsid,
         "globalFilters": [
             {"type": "segment", "segmentId": segment_id},
-            {"type": "dateRange", "dateRange": f"{START_DATE}/{END_DATE}"}
+            {"type": "dateRange", "dateRange": f"{day_start_iso}/{day_end_iso}"}
         ],
         "metricContainer": {
             "metrics": [
@@ -205,7 +231,7 @@ def build_payload(rsid: str, segment_id: str, page: int, limit: int) -> Dict[str
                 {"columnId": "4", "id": NTF_ID},
             ]
         },
-        "dimension": "variables/geodma",
+        "dimension": DIMENSION,
         "settings": {
             "countRepeatInstances": True,
             "includeAnnotations": True,
@@ -215,13 +241,13 @@ def build_payload(rsid: str, segment_id: str, page: int, limit: int) -> Dict[str
         }
     }
 
-def parse_rows_to_df(rows: List[Dict[str, Any]], date_label: str, ch_name: str) -> pd.DataFrame:
+def parse_rows_to_df(rows: List[Dict[str, Any]], day_label: str, ch_name: str) -> pd.DataFrame:
     cleaned = clean_channel_name(ch_name)
     out = []
     for r in rows or []:
         vals = r.get("data", [])
         out.append({
-            "Date": date_label,
+            "Date": day_label,
             "DMA": r.get("value"),
             "Last_Touch_Channel": cleaned,
             "Visits": vals[0] if len(vals) > 0 else None,
@@ -239,10 +265,20 @@ def _sleep_backoff(attempt: int, base: float = 0.75, cap: float = 20.0):
     delay = min(cap, base * (2 ** attempt) + 0.05 * attempt)
     time.sleep(delay)
 
-def fetch_page(session: requests.Session, rsid: str, segment_id: str, page: int, limit: int) -> Dict[str, Any]:
-    seg_dir = CACHE_DIR / rsid / segment_id
-    seg_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = seg_dir / f"page_{page:05d}.json"
+def fetch_page(
+    session: requests.Session,
+    rsid: str,
+    segment_id: str,
+    day_label: str,
+    day_start_iso: str,
+    day_end_iso: str,
+    page: int,
+    limit: int,
+) -> Dict[str, Any]:
+    # Cache is day-specific so daily pulls don't collide
+    seg_day_dir = CACHE_DIR / rsid / segment_id / day_label
+    seg_day_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = seg_day_dir / f"page_{page:05d}.json"
 
     if cache_file.exists():
         with cache_file.open("r", encoding="utf-8") as f:
@@ -250,7 +286,7 @@ def fetch_page(session: requests.Session, rsid: str, segment_id: str, page: int,
 
     max_attempts = 6
     attempt = 0
-    payload = build_payload(rsid, segment_id, page, limit)
+    payload = build_payload(rsid, segment_id, page, limit, day_start_iso, day_end_iso)
 
     while attempt < max_attempts:
         token = TOKEN.get_token()
@@ -275,13 +311,17 @@ def fetch_page(session: requests.Session, rsid: str, segment_id: str, page: int,
                 ra = resp.headers.get("Retry-After")
                 attempt += 1
                 if ra:
-                    try: time.sleep(float(ra))
-                    except Exception: _sleep_backoff(attempt)
+                    try:
+                        time.sleep(float(ra))
+                    except Exception:
+                        _sleep_backoff(attempt)
                 else:
                     _sleep_backoff(attempt)
                 continue
 
-            raise RuntimeError(f"HTTP {status} for rsid={rsid}, segment={segment_id}, page={page}: {resp.text}")
+            raise RuntimeError(
+                f"HTTP {status} for rsid={rsid}, segment={segment_id}, day={day_label}, page={page}: {resp.text}"
+            )
 
         except requests.Timeout:
             attempt += 1
@@ -290,7 +330,9 @@ def fetch_page(session: requests.Session, rsid: str, segment_id: str, page: int,
             attempt += 1
             _sleep_backoff(attempt)
 
-    raise RuntimeError(f"Failed to fetch rsid={rsid} segment={segment_id} page={page} after {max_attempts} attempts")
+    raise RuntimeError(
+        f"Failed to fetch rsid={rsid} segment={segment_id} day={day_label} page={page} after {max_attempts} attempts"
+    )
 
 
 # ================== FTP upload helper ==================
@@ -352,36 +394,54 @@ def upload_to_ftp(local_path: Path, remote_dir: str, host: str, user: str, pwd: 
 
 # ================== Orchestration ==================
 
-def get_first_and_total_pages(session: requests.Session, rsid: str, segment_id: str) -> Tuple[Dict[str, Any], int]:
-    first = fetch_page(session, rsid, segment_id, 0, PAGE_SIZE)
+def get_first_and_total_pages(
+    session: requests.Session,
+    rsid: str,
+    segment_id: str,
+    day_label: str,
+    day_start_iso: str,
+    day_end_iso: str,
+) -> Tuple[Dict[str, Any], int]:
+    first = fetch_page(session, rsid, segment_id, day_label, day_start_iso, day_end_iso, 0, PAGE_SIZE)
     total_pages = int(first.get("totalPages", 1))
     return first, total_pages
 
-def fetch_all_pages_for_combo(rsid: str, segment_id: str, channel_name: str) -> pd.DataFrame:
-    date_label = f"{START_D} to {END_D}"
+def fetch_all_pages_for_combo_day(
+    rsid: str,
+    segment_id: str,
+    channel_name: str,
+    day_start_iso: str,
+    day_end_iso: str,
+    day_label: str,
+) -> pd.DataFrame:
     frames: List[pd.DataFrame] = []
-    seg_dir = CACHE_DIR / rsid / segment_id
-    seg_dir.mkdir(parents=True, exist_ok=True)
+    seg_day_dir = CACHE_DIR / rsid / segment_id / day_label
+    seg_day_dir.mkdir(parents=True, exist_ok=True)
 
     with requests.Session() as session:
-        first, total_pages = get_first_and_total_pages(session, rsid, segment_id)
-        frames.append(parse_rows_to_df(first.get("rows", []), date_label, channel_name))
+        first, total_pages = get_first_and_total_pages(session, rsid, segment_id, day_label, day_start_iso, day_end_iso)
+        frames.append(parse_rows_to_df(first.get("rows", []), day_label, channel_name))
 
         cached_pages = {
-            int(p.stem.split("_")[-1]) for p in seg_dir.glob("page_*.json")
+            int(p.stem.split("_")[-1]) for p in seg_day_dir.glob("page_*.json")
             if p.stem.split("_")[-1].isdigit()
         }
         needed = [p for p in range(1, total_pages) if p not in cached_pages]
 
         if needed:
-            pbar = tqdm(total=len(needed),
-                        desc=f"[{rsid} | {clean_channel_name(channel_name)}] pages 1..{total_pages-1}",
-                        leave=False)
+            pbar = tqdm(
+                total=len(needed),
+                desc=f"[{rsid} | {clean_channel_name(channel_name)} | {day_label}] pages 1..{total_pages-1}",
+                leave=False
+            )
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-                futures = {pool.submit(fetch_page, session, rsid, segment_id, p, PAGE_SIZE): p for p in needed}
+                futures = {
+                    pool.submit(fetch_page, session, rsid, segment_id, day_label, day_start_iso, day_end_iso, p, PAGE_SIZE): p
+                    for p in needed
+                }
                 for fut in as_completed(futures):
                     data = fut.result()
-                    frames.append(parse_rows_to_df(data.get("rows", []), date_label, channel_name))
+                    frames.append(parse_rows_to_df(data.get("rows", []), day_label, channel_name))
                     pbar.update(1)
             pbar.close()
 
@@ -392,7 +452,11 @@ def fetch_all_pages_for_combo(rsid: str, segment_id: str, channel_name: str) -> 
 def main():
     problems: List[str] = []
     had_any_sheet = False
-    out_path = OUTPUT_DIR / f"adobe_dma_by_segment_{START_D}_to_{END_D}.xlsx"
+
+    # ---------- KS-style weekly filename pattern ----------
+    # KS example: adobe_dma_by_segment_KS_2025-12-28_to_2026-01-03.xlsx
+    week_end_inclusive = (END_DATE_D_EXCL - timedelta(days=1)).strftime("%Y-%m-%d")
+    out_path = OUTPUT_DIR / f"adobe_dma_by_segment_WW_{START_D}_to_{week_end_inclusive}.xlsx"
 
     brand_pbar = tqdm(total=len(BRAND_RSIDS), desc="Brands", leave=True)
 
@@ -403,15 +467,31 @@ def main():
                 seg_pbar = tqdm(total=len(seg_ids), desc=f"Segments ({rsid})", leave=False)
 
                 frames_for_brand: List[pd.DataFrame] = []
+
                 for seg_id in seg_ids:
                     ch_name = SEGMENTS[seg_id]
+
+                    # Day-level loop (daily rows)
+                    day_pbar = tqdm(total=len(DAY_RANGES), desc=f"Days ({clean_channel_name(ch_name)})", leave=False)
                     try:
-                        df_combo = fetch_all_pages_for_combo(rsid, seg_id, ch_name)
-                        if not df_combo.empty:
-                            frames_for_brand.append(df_combo)
-                    except Exception as e:
-                        problems.append(f"{rsid} | {seg_id}: {e}")
+                        for day_start_iso, day_end_iso, day_label in DAY_RANGES:
+                            try:
+                                df_day = fetch_all_pages_for_combo_day(
+                                    rsid=rsid,
+                                    segment_id=seg_id,
+                                    channel_name=ch_name,
+                                    day_start_iso=day_start_iso,
+                                    day_end_iso=day_end_iso,
+                                    day_label=day_label,
+                                )
+                                if not df_day.empty:
+                                    frames_for_brand.append(df_day)
+                            except Exception as e:
+                                problems.append(f"{rsid} | {seg_id} | {day_label}: {e}")
+                            finally:
+                                day_pbar.update(1)
                     finally:
+                        day_pbar.close()
                         seg_pbar.update(1)
 
                 seg_pbar.close()
@@ -419,11 +499,15 @@ def main():
                 if frames_for_brand:
                     df_brand = pd.concat(frames_for_brand, ignore_index=True)
                     df_brand = df_brand[OUTPUT_COLUMNS]
+
+                    # Stable sort for readability
+                    df_brand.sort_values(by=["Date", "Last_Touch_Channel", "DMA"], inplace=True, kind="mergesort")
+
                     sheet_name = rsid[:31]
                     df_brand.to_excel(writer, sheet_name=sheet_name, index=False)
                     had_any_sheet = True
                 else:
-                    problems.append(f"{rsid}: no data collected for any segment.")
+                    problems.append(f"{rsid}: no data collected for any segment/day.")
 
             except Exception as e:
                 problems.append(f"{rsid}: {e}")
@@ -448,8 +532,11 @@ def main():
         print("Some items had issues:")
         for p in problems:
             print(" -", p)
-    print("• Resumable cache: .aa_cache/<rsid>/<segment_id>/page_XXXXX.json")
+
+    print("• Resumable cache: .aa_cache/<rsid>/<segment_id>/<YYYY-MM-DD>/page_XXXXX.json")
     print("• Columns:", ", ".join(OUTPUT_COLUMNS))
+    print(f"• Week window (exclusive end in AA): {START_D} to {END_D}")
+    print(f"• Filename window (inclusive end): {START_D} to {week_end_inclusive}")
 
     # --- FTP upload if env vars are present ---
     if FTP_HOST and FTP_USER and FTP_PASS:
@@ -465,5 +552,7 @@ if __name__ == "__main__":
     if not REPORT_URL:
         raise SystemExit("AA_COMPANY_ID is not set; REPORT_URL cannot be built.")
     if not (AA_CLIENT_ID and AA_CLIENT_SECRET and AA_ORG_ID and AA_API_KEY and AA_COMPANY_ID):
-        raise SystemExit("Missing one or more Adobe API env vars: AA_CLIENT_ID, AA_CLIENT_SECRET, AA_ORG_ID, AA_API_KEY, AA_COMPANY_ID.")
+        raise SystemExit(
+            "Missing one or more Adobe API env vars: AA_CLIENT_ID, AA_CLIENT_SECRET, AA_ORG_ID, AA_API_KEY, AA_COMPANY_ID."
+        )
     main()
