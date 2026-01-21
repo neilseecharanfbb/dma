@@ -7,7 +7,7 @@ KS-aligned behavior:
 - ONE weekly XLSX file
 - Data is pulled per DAY (Date column is YYYY-MM-DD)
 - File name pattern matches KS:
-    adobe_dma_by_segment_KS_<weekStartYYYY-MM-DD>_to_<weekEndYYYY-MM-DD>.xlsx
+    adobe_dma_by_segment_WW_<weekStartYYYY-MM-DD>_to_<weekEndYYYY-MM-DD>.xlsx
   where weekEnd is SATURDAY (inclusive)
 - Fast via ThreadPoolExecutor
 - Resumable per-page cache (day-specific):
@@ -15,9 +15,18 @@ KS-aligned behavior:
 - Excel output (one sheet per RSID) with columns:
   Date, DMA, Last_Touch_Channel, Visits, Orders, Demand, NMA, NTF
 
+FISCAL behavior (4-4-5 anchored to FY26):
+- Weeks are Sunday->Saturday
+- Fiscal Week 1 of FY2026 starts 2026-01-04 and ends 2026-01-10
+- Auto mode (no START_DATE/END_DATE env) pulls the *last completed* fiscal week:
+    start = prior Sunday 00:00:00.000
+    end   = current week Sunday 00:00:00.000 (exclusive)
+- Adds an FY/WK tag into the filename when the week start is >= FY26 anchor:
+    adobe_dma_by_segment_WW_FY2026_WK01_2026-01-04_to_2026-01-10.xlsx
+
 Date behavior:
 - Uses START_DATE/END_DATE from env if provided (ISO 8601 with ms),
-  otherwise auto-computes the prior Sunday->Sunday (exclusive) in America/New_York.
+  otherwise auto-computes the prior fiscal week window (Sun->Sun exclusive) in America/New_York.
 - Expands that range into individual days and queries each day separately.
 """
 
@@ -34,6 +43,7 @@ from datetime import datetime, timedelta, date
 import requests
 import pandas as pd
 from tqdm.auto import tqdm
+
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
@@ -84,12 +94,12 @@ SEGMENTS: Dict[str, str] = {
 VISITS_ID = "metrics/visits"
 ORDERS_ID = "metrics/orders"
 DEMAND_ID = "cm300006919_5a132314ae06387a6a2fec85"
-NMA_ID    = "metrics/event233"
-NTF_ID    = "metrics/event263"
+NMA_ID = "metrics/event233"
+NTF_ID = "metrics/event263"
 DIMENSION = "variables/geodma"
 
 # Performance
-PAGE_SIZE   = int(os.environ.get("PAGE_SIZE", "2000"))
+PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "2000"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "8"))
 
 # Output
@@ -108,29 +118,68 @@ OAUTH_SCOPES = "openid,AdobeID,read_organizations,additional_info.projectedProdu
 FTP_HOST = os.environ.get("FTP_HOST", "")
 FTP_USER = os.environ.get("FTP_USER", "")
 FTP_PASS = os.environ.get("FTP_PASS", "")
-FTP_DIR  = os.environ.get("FTP_DIR", "/")  # remote folder (default root)
-FTP_TLS  = os.environ.get("FTP_TLS", "true").lower() in {"1", "true", "yes"}  # try FTPS first
+FTP_DIR = os.environ.get("FTP_DIR", "/")  # remote folder (default root)
+FTP_TLS = os.environ.get("FTP_TLS", "true").lower() in {"1", "true", "yes"}  # try FTPS first
 
 
-# ================== Date range helpers ==================
+# ================== Date range helpers (FY26 anchored 4-4-5) ==================
 
-def prior_week_sun_to_sun_iso() -> Tuple[str, str, str, str]:
+def _week_start_sunday(d: date) -> date:
+    """Return the Sunday that starts the week containing date d (Sun-Sat week)."""
+    # Python weekday: Mon=0..Sun=6
+    days_since_sunday = (d.weekday() + 1) % 7
+    return d - timedelta(days=days_since_sunday)
+
+def _parse_ymd(s: str) -> date:
+    return date.fromisoformat(s.strip())
+
+# FY26 anchor: Week 1 starts Sunday 2026-01-04 (ends Saturday 2026-01-10)
+FISCAL_WEEK1_START_YMD = os.environ.get("FISCAL_WEEK1_START_YMD", "2026-01-04")
+FISCAL_YEAR_LABEL = int(os.environ.get("FISCAL_YEAR_LABEL", "2026"))
+
+FISCAL_WEEK1_START = _parse_ymd(FISCAL_WEEK1_START_YMD)
+if _week_start_sunday(FISCAL_WEEK1_START) != FISCAL_WEEK1_START:
+    raise SystemExit(
+        f"FISCAL_WEEK1_START_YMD must be a Sunday. Got {FISCAL_WEEK1_START_YMD} "
+        f"(Sunday start would be {_week_start_sunday(FISCAL_WEEK1_START)})."
+    )
+
+def fiscal_year_and_week_for_week_start(week_start: date) -> Tuple[Optional[int], Optional[int]]:
     """
-    Compute prior Sunday->Sunday (exclusive) as an AA dateRange:
-    start = prior Sunday 00:00:00.000
-    end   = last Sunday  00:00:00.000 (exclusive)
-    Return (start_iso, end_iso, start_date_str, end_date_str)
+    Return (fiscal_year, fiscal_week_no) for a given week_start Sunday.
+
+    - For weeks starting on/after FY anchor (FISCAL_WEEK1_START), we compute FY and week number.
+    - For weeks before the anchor, we return (None, None) to avoid mislabeling prior fiscal years.
+    """
+    if week_start < FISCAL_WEEK1_START:
+        return None, None
+
+    fy = FISCAL_YEAR_LABEL
+    week_no = ((week_start - FISCAL_WEEK1_START).days // 7) + 1
+    return fy, week_no
+
+def prior_fiscal_week_sun_to_sun_iso() -> Tuple[str, str, str, str, Optional[int], Optional[int]]:
+    """
+    Compute *last completed* fiscal week as Sunday->Sunday (exclusive):
+      start = prior week Sunday 00:00:00.000
+      end   = current week Sunday 00:00:00.000 (exclusive)
+    Returns:
+      (start_iso, end_iso, start_ymd, end_ymd, fiscal_year, fiscal_week_no)
+
+    This aligns to Sun-Sat with inclusive Saturday = end - 1 day.
     """
     tz = ZoneInfo("America/New_York")
-    now = datetime.now(tz)
-    # Python Mon=0..Sun=6
-    days_since_sunday = (now.weekday() + 1) % 7
-    last_sunday = (now - timedelta(days=days_since_sunday)).date()
-    start = last_sunday - timedelta(days=7)
-    end = last_sunday
+    today = datetime.now(tz).date()
+
+    current_week_start = _week_start_sunday(today)          # Sunday of THIS week
+    start = current_week_start - timedelta(days=7)          # Sunday of LAST completed week
+    end = current_week_start                                # exclusive end (Sunday)
+
+    fy, wk = fiscal_year_and_week_for_week_start(start)
+
     start_iso = f"{start}T00:00:00.000"
     end_iso = f"{end}T00:00:00.000"
-    return start_iso, end_iso, str(start), str(end)
+    return start_iso, end_iso, str(start), str(end), fy, wk
 
 def iso_to_date(iso_str: str) -> date:
     return date.fromisoformat(iso_str[:10])
@@ -151,10 +200,15 @@ def iter_days(start_d: date, end_d_exclusive: date) -> List[Tuple[str, str, str]
 START_DATE = os.environ.get("START_DATE")
 END_DATE = os.environ.get("END_DATE")
 
+FISCAL_YEAR = None
+FISCAL_WEEK = None
+
 if not START_DATE or not END_DATE:
-    START_DATE, END_DATE, START_D, END_D = prior_week_sun_to_sun_iso()
+    START_DATE, END_DATE, START_D, END_D, FISCAL_YEAR, FISCAL_WEEK = prior_fiscal_week_sun_to_sun_iso()
 else:
     START_D, END_D = START_DATE[:10], END_DATE[:10]
+    fy, wk = fiscal_year_and_week_for_week_start(_week_start_sunday(iso_to_date(START_DATE)))
+    FISCAL_YEAR, FISCAL_WEEK = fy, wk
 
 START_DATE_D = iso_to_date(START_DATE)
 END_DATE_D_EXCL = iso_to_date(END_DATE)
@@ -253,8 +307,8 @@ def parse_rows_to_df(rows: List[Dict[str, Any]], day_label: str, ch_name: str) -
             "Visits": vals[0] if len(vals) > 0 else None,
             "Orders": vals[1] if len(vals) > 1 else None,
             "Demand": vals[2] if len(vals) > 2 else None,
-            "NMA":    vals[3] if len(vals) > 3 else None,
-            "NTF":    vals[4] if len(vals) > 4 else None,
+            "NMA": vals[3] if len(vals) > 3 else None,
+            "NTF": vals[4] if len(vals) > 4 else None,
         })
     return pd.DataFrame(out, columns=OUTPUT_COLUMNS)
 
@@ -453,10 +507,15 @@ def main():
     problems: List[str] = []
     had_any_sheet = False
 
-    # ---------- KS-style weekly filename pattern ----------
-    # KS example: adobe_dma_by_segment_KS_2025-12-28_to_2026-01-03.xlsx
+    # ---------- Weekly filename pattern with optional FY/WK tag ----------
+    # Inclusive week end is Saturday = exclusive end - 1 day
     week_end_inclusive = (END_DATE_D_EXCL - timedelta(days=1)).strftime("%Y-%m-%d")
-    out_path = OUTPUT_DIR / f"adobe_dma_by_segment_WW_{START_D}_to_{week_end_inclusive}.xlsx"
+
+    fywk = ""
+    if FISCAL_YEAR is not None and FISCAL_WEEK is not None:
+        fywk = f"FY{FISCAL_YEAR}_WK{FISCAL_WEEK:02d}_"
+
+    out_path = OUTPUT_DIR / f"adobe_dma_by_segment_WW_{fywk}{START_D}_to_{week_end_inclusive}.xlsx"
 
     brand_pbar = tqdm(total=len(BRAND_RSIDS), desc="Brands", leave=True)
 
@@ -537,6 +596,10 @@ def main():
     print("• Columns:", ", ".join(OUTPUT_COLUMNS))
     print(f"• Week window (exclusive end in AA): {START_D} to {END_D}")
     print(f"• Filename window (inclusive end): {START_D} to {week_end_inclusive}")
+    if FISCAL_YEAR is not None and FISCAL_WEEK is not None:
+        print(f"• Fiscal tag: FY{FISCAL_YEAR} WK{FISCAL_WEEK:02d} (anchor week1={FISCAL_WEEK1_START})")
+    else:
+        print(f"• Fiscal tag: (not labeled — week start is before FY anchor {FISCAL_WEEK1_START})")
 
     # --- FTP upload if env vars are present ---
     if FTP_HOST and FTP_USER and FTP_PASS:
