@@ -5,6 +5,7 @@ on:
     # Dual cron so it always aligns with 8:00 PM America/New_York across DST shifts.
     - cron: '0 0 * * 3'   # Wed 00:00 UTC == Tue 8:00 PM ET (DST, UTC-4)
     - cron: '0 1 * * 3'   # Wed 01:00 UTC == Tue 8:00 PM ET (Standard, UTC-5)
+
   workflow_dispatch:
     inputs:
       force_run:
@@ -12,6 +13,16 @@ on:
         required: false
         type: boolean
         default: false
+      override_start_iso:
+        description: "Override START_DATE (ISO, e.g. 2026-01-04T00:00:00.000). Leave blank for automatic."
+        required: false
+        type: string
+        default: ""
+      override_end_iso:
+        description: "Override END_DATE (ISO EXCLUSIVE end, e.g. 2026-01-11T00:00:00.000). Leave blank for automatic."
+        required: false
+        type: string
+        default: ""
 
 jobs:
   weekly-report:
@@ -23,7 +34,7 @@ jobs:
         uses: actions/checkout@v4
 
       # Guard:
-      # - workflow_dispatch => always RUN=yes (or force_run input)
+      # - workflow_dispatch => always RUN=yes
       # - schedule => RUN=yes only if it's Tue 8:00 PM ET (unless force_run/vars override)
       #
       # NOTE: You can also bypass scheduled rerun guards by setting a repo Variable:
@@ -71,16 +82,17 @@ jobs:
         if: steps.guard.outputs.RUN == 'yes'
         run: pip install -r requirements.txt
 
-      # UPDATED:
-      # Computes last completed Sun->Sun (exclusive) week window in America/New_York,
-      # then assigns fiscal year + week number from anchors:
+      # Computes Sun->Sun exclusive window (either override, or last completed week in ET)
+      # And assigns fiscal FY/WK based on anchors:
       #   FY2025 week1 = 2024-12-29
       #   FY2026 week1 = 2026-01-04
-      - name: "Compute prior fiscal week (Sun->Sun exclusive) window (America/New_York) + FY/WK tag"
+      - name: "Compute fiscal week window (Sun->Sun exclusive) + FY/WK tag (supports overrides)"
         if: steps.guard.outputs.RUN == 'yes'
         id: week
         env:
           FISCAL_ANCHORS: "2025=2024-12-29,2026=2026-01-04"
+          OVERRIDE_START: ${{ inputs.override_start_iso || '' }}
+          OVERRIDE_END:   ${{ inputs.override_end_iso || '' }}
         run: |
           python - <<'PY'
           import os
@@ -88,41 +100,56 @@ jobs:
           from zoneinfo import ZoneInfo
 
           def week_start_sunday(d: date) -> date:
-              days_since_sunday = (d.weekday() + 1) % 7  # Mon=0..Sun=6
-              return d - timedelta(days=days_since_sunday)
+              # Mon=0..Sun=6
+              return d - timedelta(days=(d.weekday() + 1) % 7)
 
-          # Parse anchors like: "2025=2024-12-29,2026=2026-01-04"
-          anchors_raw = os.environ.get("FISCAL_ANCHORS", "").strip()
-          if not anchors_raw:
-              raise SystemExit("FISCAL_ANCHORS is required, e.g. '2025=2024-12-29,2026=2026-01-04'")
+          def parse_anchors(raw: str):
+              raw = (raw or "").strip()
+              if not raw:
+                  raise SystemExit("FISCAL_ANCHORS is required, e.g. '2025=2024-12-29,2026=2026-01-04'")
+              anchors = []
+              for part in [p.strip() for p in raw.split(",") if p.strip()]:
+                  if "=" not in part:
+                      raise SystemExit(f"Invalid anchor '{part}'. Expected 'YYYY=YYYY-MM-DD'")
+                  fy_s, ymd = [x.strip() for x in part.split("=", 1)]
+                  fy = int(fy_s)
+                  d = date.fromisoformat(ymd)
+                  if week_start_sunday(d) != d:
+                      raise SystemExit(f"Anchor for FY{fy} must be a Sunday. Got {d} (Sunday start would be {week_start_sunday(d)})")
+                  anchors.append((fy, d))
+              anchors.sort(key=lambda x: x[1])
+              return anchors
 
-          anchors = []
-          for part in anchors_raw.split(","):
-              part = part.strip()
-              if not part:
-                  continue
-              fy_str, ymd = [x.strip() for x in part.split("=", 1)]
-              fy = int(fy_str)
-              d = date.fromisoformat(ymd)
-              if week_start_sunday(d) != d:
-                  raise SystemExit(f"Anchor for FY{fy} must be a Sunday. Got {d} (Sunday start would be {week_start_sunday(d)})")
-              anchors.append((fy, d))
+          anchors = parse_anchors(os.environ.get("FISCAL_ANCHORS"))
 
-          # Sort by date ascending
-          anchors.sort(key=lambda x: x[1])
+          o_start = (os.environ.get("OVERRIDE_START") or "").strip()
+          o_end = (os.environ.get("OVERRIDE_END") or "").strip()
 
-          tz = ZoneInfo("America/New_York")
-          today = datetime.now(tz).date()
+          if (o_start and not o_end) or (o_end and not o_start):
+              raise SystemExit("If using overrides, you must provide BOTH override_start_iso and override_end_iso.")
 
-          current_week_start = week_start_sunday(today)      # Sunday of THIS week
-          start = current_week_start - timedelta(days=7)     # Sunday of LAST completed week
-          end_excl = current_week_start                      # exclusive end (Sunday)
-          end_incl = end_excl - timedelta(days=1)            # inclusive Saturday
+          if o_start and o_end:
+              start = date.fromisoformat(o_start[:10])
+              end_excl = date.fromisoformat(o_end[:10])
+              start_iso = o_start
+              end_iso = o_end
+              print("Using OVERRIDES for window.")
+          else:
+              tz = ZoneInfo("America/New_York")
+              today = datetime.now(tz).date()
+              current_week_start = week_start_sunday(today)      # Sunday of THIS week
+              start = current_week_start - timedelta(days=7)     # Sunday of LAST completed week
+              end_excl = current_week_start                      # exclusive end (Sunday)
+              start_iso = f"{start}T00:00:00.000"
+              end_iso = f"{end_excl}T00:00:00.000"
+              print("Using AUTO last-completed week window.")
 
-          start_iso = f"{start}T00:00:00.000"
-          end_iso = f"{end_excl}T00:00:00.000"
+          if end_excl <= start:
+              raise SystemExit(f"Invalid window: end_excl ({end_excl}) must be after start ({start}).")
 
-          # Pick latest anchor <= start
+          end_incl = end_excl - timedelta(days=1)
+
+          # Determine applicable fiscal year/week based on latest anchor <= start
           applicable = [a for a in anchors if a[1] <= start]
           if applicable:
               fy, fy_start = applicable[-1]
@@ -199,5 +226,5 @@ jobs:
         if: steps.guard.outputs.RUN == 'yes'
         uses: actions/upload-artifact@v4
         with:
-          name: weekly-aa-report-${{ steps.week.outputs.FISCAL_TAG && format('{0}-', steps.week.outputs.FISCAL_TAG) || '' }}${{ steps.week.outputs.START_DATE }}_to_${{ steps.week.outputs.END_DATE_INCL }}
+          name: weekly-aa-report-${{ steps.week.outputs.FISCAL_TAG != '' && format('{0}-', steps.week.outputs.FISCAL_TAG) || '' }}${{ steps.week.outputs.START_DATE }}_to_${{ steps.week.outputs.END_DATE_INCL }}
           path: ${{ steps.out.outputs.FILE_PATH }}
