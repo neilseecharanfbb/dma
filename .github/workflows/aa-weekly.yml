@@ -71,28 +71,71 @@ jobs:
         if: steps.guard.outputs.RUN == 'yes'
         run: pip install -r requirements.txt
 
-      - name: "Compute prior Sunday to Sunday (exclusive) window (America/New_York)"
+      # UPDATED:
+      # Computes last completed Sun->Sun (exclusive) week window in America/New_York,
+      # then assigns fiscal year + week number from anchors:
+      #   FY2025 week1 = 2024-12-29
+      #   FY2026 week1 = 2026-01-04
+      - name: "Compute prior fiscal week (Sun->Sun exclusive) window (America/New_York) + FY/WK tag"
         if: steps.guard.outputs.RUN == 'yes'
         id: week
+        env:
+          FISCAL_ANCHORS: "2025=2024-12-29,2026=2026-01-04"
         run: |
           python - <<'PY'
           import os
-          from datetime import datetime, timedelta
+          from datetime import datetime, timedelta, date
           from zoneinfo import ZoneInfo
 
+          def week_start_sunday(d: date) -> date:
+              days_since_sunday = (d.weekday() + 1) % 7  # Mon=0..Sun=6
+              return d - timedelta(days=days_since_sunday)
+
+          # Parse anchors like: "2025=2024-12-29,2026=2026-01-04"
+          anchors_raw = os.environ.get("FISCAL_ANCHORS", "").strip()
+          if not anchors_raw:
+              raise SystemExit("FISCAL_ANCHORS is required, e.g. '2025=2024-12-29,2026=2026-01-04'")
+
+          anchors = []
+          for part in anchors_raw.split(","):
+              part = part.strip()
+              if not part:
+                  continue
+              fy_str, ymd = [x.strip() for x in part.split("=", 1)]
+              fy = int(fy_str)
+              d = date.fromisoformat(ymd)
+              if week_start_sunday(d) != d:
+                  raise SystemExit(f"Anchor for FY{fy} must be a Sunday. Got {d} (Sunday start would be {week_start_sunday(d)})")
+              anchors.append((fy, d))
+
+          # Sort by date ascending
+          anchors.sort(key=lambda x: x[1])
+
           tz = ZoneInfo("America/New_York")
-          now = datetime.now(tz)
+          today = datetime.now(tz).date()
 
-          # Last Sunday relative to 'now'
-          days_since_sunday = (now.weekday() + 1) % 7
-          last_sunday = (now - timedelta(days=days_since_sunday)).date()
-
-          start = last_sunday - timedelta(days=7)  # prior Sunday
-          end_excl = last_sunday                   # exclusive end (Sunday)
-          end_incl = end_excl - timedelta(days=1)  # inclusive Saturday
+          current_week_start = week_start_sunday(today)      # Sunday of THIS week
+          start = current_week_start - timedelta(days=7)     # Sunday of LAST completed week
+          end_excl = current_week_start                      # exclusive end (Sunday)
+          end_incl = end_excl - timedelta(days=1)            # inclusive Saturday
 
           start_iso = f"{start}T00:00:00.000"
           end_iso = f"{end_excl}T00:00:00.000"
+
+          # Pick latest anchor <= start
+          applicable = [a for a in anchors if a[1] <= start]
+          if applicable:
+              fy, fy_start = applicable[-1]
+              week_no = ((start - fy_start).days // 7) + 1
+              fiscal_tag = f"FY{fy}_WK{week_no:02d}"
+              fiscal_y = str(fy)
+              fiscal_wk = f"{week_no:02d}"
+          else:
+              fiscal_tag = ""
+              fiscal_y = ""
+              fiscal_wk = ""
+
+          cache_key = f"aa-cache-{fiscal_tag + '-' if fiscal_tag else ''}{start}_to_{end_excl}"
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"START_ISO={start_iso}\n")
@@ -100,7 +143,17 @@ jobs:
               f.write(f"START_DATE={start}\n")
               f.write(f"END_DATE_EXCL={end_excl}\n")
               f.write(f"END_DATE_INCL={end_incl}\n")
-              f.write(f"CACHE_KEY=aa-cache-{start}_to_{end_excl}\n")
+              f.write(f"FISCAL_Y={fiscal_y}\n")
+              f.write(f"FISCAL_WK={fiscal_wk}\n")
+              f.write(f"FISCAL_TAG={fiscal_tag}\n")
+              f.write(f"CACHE_KEY={cache_key}\n")
+
+          print("Computed window:")
+          print("  START:", start_iso)
+          print("  END  :", end_iso, "(exclusive)")
+          print("  END_INCL:", end_incl)
+          print("  FISCAL_TAG:", fiscal_tag or "(none)")
+          print("  CACHE_KEY:", cache_key)
           PY
 
       - name: Cache AA pages (resumable)
@@ -124,6 +177,9 @@ jobs:
           START_DATE: ${{ steps.week.outputs.START_ISO }}
           END_DATE: ${{ steps.week.outputs.END_ISO }}
 
+          # ---- Fiscal anchors (FY25 + FY26) ----
+          FISCAL_ANCHORS: "2025=2024-12-29,2026=2026-01-04"
+
           # ---- FTP (Adobe Omniture) ----
           FTP_HOST: ftp.omniture.com
           FTP_USER: ${{ secrets.FTP_USER }}
@@ -143,5 +199,5 @@ jobs:
         if: steps.guard.outputs.RUN == 'yes'
         uses: actions/upload-artifact@v4
         with:
-          name: weekly-aa-report-${{ steps.week.outputs.START_DATE }}_to_${{ steps.week.outputs.END_DATE_INCL }}
+          name: weekly-aa-report-${{ steps.week.outputs.FISCAL_TAG && format('{0}-', steps.week.outputs.FISCAL_TAG) || '' }}${{ steps.week.outputs.START_DATE }}_to_${{ steps.week.outputs.END_DATE_INCL }}
           path: ${{ steps.out.outputs.FILE_PATH }}
