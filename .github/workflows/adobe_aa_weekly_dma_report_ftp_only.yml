@@ -1,0 +1,229 @@
+name: Adobe AA Weekly DMA Report (FTP only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: "Bypass time guard and run now"
+        required: false
+        type: boolean
+        default: false
+      override_start_iso:
+        description: "Override START_DATE (ISO, e.g. 2026-01-04T00:00:00.000). Leave blank for automatic."
+        required: false
+        type: string
+        default: ""
+      override_end_iso:
+        description: "Override END_DATE (ISO EXCLUSIVE end, e.g. 2026-01-11T00:00:00.000). Leave blank for automatic."
+        required: false
+        type: string
+        default: ""
+
+  schedule:
+    # Tue 8pm ET => Wed 00:00 UTC during EDT, 01:00 UTC during EST.
+    # Run both; guard ensures it only proceeds when it's exactly Tue 20:00 in America/New_York.
+    - cron: "0 0 * * 3"
+    - cron: "0 1 * * 3"
+
+jobs:
+  weekly-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ---- Guard: only run at Tue 20:00 ET for schedule; allow workflow_dispatch or FORCE_RUN ----
+      - name: Guard - proceed only at Tue 20:00 America/New_York (or force)
+        id: guard
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE_RUN_VAR: ${{ vars.FORCE_RUN }}
+          FORCE_RUN_INPUT: ${{ github.event.inputs.force_run }}
+        run: |
+          python - <<'PY'
+          import os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          event_name = (os.getenv("EVENT_NAME") or "").strip()
+          force_var = (os.getenv("FORCE_RUN_VAR") or "").strip().lower() in {"1","true","yes","y"}
+          force_input = (os.getenv("FORCE_RUN_INPUT") or "").strip().lower() in {"1","true","yes","y"}
+
+          now = datetime.now(ZoneInfo("America/New_York"))
+          is_target_time = (now.weekday() == 1 and now.hour == 20)  # Tue 8pm
+
+          # Rules:
+          # - workflow_dispatch: always run (or force)
+          # - schedule: run only if Tue 20:00 ET (or FORCE_RUN var)
+          if event_name == "workflow_dispatch":
+              should_run = True
+          else:
+              should_run = True if (force_var or is_target_time) else False
+
+          print("Event:", event_name)
+          print("ET now:", now.isoformat())
+          print("force_var:", force_var)
+          print("force_input:", force_input)
+          print("is_target_time:", is_target_time)
+          print("should_run:", should_run)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("run=true\n" if should_run else "run=false\n")
+          PY
+
+      - name: Compute fiscal week window (Sun->Sun exclusive) + FY/WK tag (supports overrides)
+        if: steps.guard.outputs.run == 'true'
+        id: week
+        env:
+          FISCAL_ANCHORS: "2025=2024-12-29,2026=2026-01-04"
+          OVERRIDE_START: ${{ github.event.inputs.override_start_iso }}
+          OVERRIDE_END:   ${{ github.event.inputs.override_end_iso }}
+        run: |
+          python - <<'PY'
+          import os
+          from datetime import datetime, timedelta, date
+          from zoneinfo import ZoneInfo
+
+          def week_start_sunday(d: date) -> date:
+              # Mon=0..Sun=6
+              return d - timedelta(days=(d.weekday() + 1) % 7)
+
+          def parse_anchors(raw: str):
+              raw = (raw or "").strip()
+              if not raw:
+                  raise SystemExit("FISCAL_ANCHORS is required, e.g. '2025=2024-12-29,2026=2026-01-04'")
+              anchors = []
+              for part in [p.strip() for p in raw.split(",") if p.strip()]:
+                  if "=" not in part:
+                      raise SystemExit(f"Invalid anchor '{part}'. Expected 'YYYY=YYYY-MM-DD'")
+                  fy_s, ymd = [x.strip() for x in part.split("=", 1)]
+                  fy = int(fy_s)
+                  d = date.fromisoformat(ymd)
+                  if week_start_sunday(d) != d:
+                      raise SystemExit(f"Anchor for FY{fy} must be a Sunday. Got {d} (Sunday start would be {week_start_sunday(d)})")
+                  anchors.append((fy, d))
+              anchors.sort(key=lambda x: x[1])
+              return anchors
+
+          anchors = parse_anchors(os.environ.get("FISCAL_ANCHORS"))
+
+          o_start = (os.environ.get("OVERRIDE_START") or "").strip()
+          o_end = (os.environ.get("OVERRIDE_END") or "").strip()
+
+          if (o_start and not o_end) or (o_end and not o_start):
+              raise SystemExit("If using overrides, you must provide BOTH override_start_iso and override_end_iso.")
+
+          if o_start and o_end:
+              start = date.fromisoformat(o_start[:10])
+              end_excl = date.fromisoformat(o_end[:10])
+              start_iso = o_start
+              end_iso = o_end
+              print("Using OVERRIDES for window.")
+          else:
+              tz = ZoneInfo("America/New_York")
+              today = datetime.now(tz).date()
+              current_week_start = week_start_sunday(today)      # Sunday of THIS week
+              start = current_week_start - timedelta(days=7)     # Sunday of LAST completed week
+              end_excl = current_week_start                      # exclusive end (Sunday)
+              start_iso = f"{start}T00:00:00.000"
+              end_iso = f"{end_excl}T00:00:00.000"
+              print("Using AUTO last-completed week window.")
+
+          if end_excl <= start:
+              raise SystemExit(f"Invalid window: end_excl ({end_excl}) must be after start ({start}).")
+
+          end_incl = end_excl - timedelta(days=1)
+
+          applicable = [a for a in anchors if a[1] <= start]
+          if applicable:
+              fy, fy_start = applicable[-1]
+              week_no = ((start - fy_start).days // 7) + 1
+              fiscal_tag = f"FY{fy}_WK{week_no:02d}"
+              fiscal_y = str(fy)
+              fiscal_wk = f"{week_no:02d}"
+          else:
+              fiscal_tag = ""
+              fiscal_y = ""
+              fiscal_wk = ""
+
+          cache_key = f"aa-cache-{fiscal_tag + '-' if fiscal_tag else ''}{start}_to_{end_excl}"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"START_ISO={start_iso}\n")
+              f.write(f"END_ISO={end_iso}\n")
+              f.write(f"START_DATE={start}\n")
+              f.write(f"END_DATE_EXCL={end_excl}\n")
+              f.write(f"END_DATE_INCL={end_incl}\n")
+              f.write(f"FISCAL_Y={fiscal_y}\n")
+              f.write(f"FISCAL_WK={fiscal_wk}\n")
+              f.write(f"FISCAL_TAG={fiscal_tag}\n")
+              f.write(f"CACHE_KEY={cache_key}\n")
+
+          print("Computed window:")
+          print("  START:", start_iso)
+          print("  END  :", end_iso, "(exclusive)")
+          print("  END_INCL:", end_incl)
+          print("  FISCAL_TAG:", fiscal_tag or "(none)")
+          print("  CACHE_KEY:", cache_key)
+          PY
+
+      - name: Cache AA pages (resumable)
+        if: steps.guard.outputs.run == 'true'
+        uses: actions/cache@v4
+        with:
+          path: .aa_cache
+          key: ${{ steps.week.outputs.CACHE_KEY }}
+          restore-keys: |
+            aa-cache-
+
+      - name: Run report (and upload to FTP)
+        if: steps.guard.outputs.run == 'true'
+        env:
+          # ---- Adobe ----
+          AA_CLIENT_ID: ${{ secrets.AA_CLIENT_ID }}
+          AA_CLIENT_SECRET: ${{ secrets.AA_CLIENT_SECRET }}
+          AA_API_KEY: ${{ secrets.AA_API_KEY }}
+          AA_ORG_ID: ${{ secrets.AA_ORG_ID }}
+          AA_COMPANY_ID: ${{ secrets.AA_COMPANY_ID }}
+
+          START_DATE: ${{ steps.week.outputs.START_ISO }}
+          END_DATE: ${{ steps.week.outputs.END_ISO }}
+
+          # ---- Fiscal anchors ----
+          FISCAL_ANCHORS: "2025=2024-12-29,2026=2026-01-04"
+
+          # ---- FTP (Adobe Omniture) ----
+          FTP_HOST: ftp.omniture.com
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+          FTP_DIR: "/dma"
+          FTP_TLS: "true"
+        run: |
+          python aa_dma_by_segment.py
+
+      - name: Get output path
+        if: steps.guard.outputs.run == 'true'
+        id: out
+        run: |
+          echo "FILE_PATH=$(cat output/latest.txt)" >> $GITHUB_OUTPUT
+
+      - name: Upload artifact
+        if: steps.guard.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-aa-report-${{ steps.week.outputs.FISCAL_TAG != '' && format('{0}-', steps.week.outputs.FISCAL_TAG) || '' }}${{ steps.week.outputs.START_DATE }}_to_${{ steps.week.outputs.END_DATE_INCL }}
+          path: ${{ steps.out.outputs.FILE_PATH }}
+          if-no-files-found: error
