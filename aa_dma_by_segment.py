@@ -2,43 +2,35 @@
 # -*- coding: utf-8 -*-
 
 """
-Adobe Analytics API 2.0 - Weekly DMA x Last Touch Channel (Segments) per RSID
-KS-aligned behavior:
+Adobe Analytics API 2.0 - Weekly DMA x Last Touch Channel (WW only)
+
+Behavior:
 - ONE weekly XLSX file
 - Data is pulled per DAY (Date column is YYYY-MM-DD)
-- File name pattern matches KS:
+- File name pattern:
     adobe_dma_by_segment_WW_<weekStartYYYY-MM-DD>_to_<weekEndYYYY-MM-DD>.xlsx
   where weekEnd is SATURDAY (inclusive)
-- Fast via ThreadPoolExecutor
-- Resumable per-page cache (day-specific):
-    .aa_cache/<rsid>/<segment_id>/<YYYY-MM-DD>/page_XXXXX.json
-- Excel output (one sheet per RSID) with columns:
-  Date, DMA, Last_Touch_Channel, Visits, Orders, Demand, NMA, NTF
 
-FISCAL behavior (4-4-5 anchored):
+Fiscal behavior (4-4-5 anchored):
 - Weeks are Sunday->Saturday
-- FY2025 week 1 starts 2024-12-29 and ends 2025-01-04
-- FY2026 week 1 starts 2026-01-04 and ends 2026-01-10
-- Auto mode (no START_DATE/END_DATE env) pulls the *last completed* Sun->Sat week:
-    start = prior Sunday 00:00:00.000
-    end   = current week Sunday 00:00:00.000 (exclusive)
-- Adds an FY/WK tag into the filename when a fiscal anchor applies:
+- Auto mode (no START_DATE/END_DATE env) pulls the last completed Sun->Sat week
+- Adds FY/WK tag into filename when a fiscal anchor applies:
     adobe_dma_by_segment_WW_FY2026_WK01_2026-01-04_to_2026-01-10.xlsx
 
-Date behavior:
-- Uses START_DATE/END_DATE from env if provided (ISO 8601 with ms),
-  otherwise auto-computes the prior week window (Sun->Sun exclusive) in America/New_York.
-- Expands that range into individual days and queries each day separately.
+Important cache behavior in this version:
+- USE_CACHE defaults to FALSE
+- CLEAR_WW_CACHE_ON_START defaults to TRUE
+- If cache is enabled, cache key includes a report signature so stale payloads do not get reused
 
-Fiscal anchors configuration:
-- Preferred: env FISCAL_ANCHORS="2025=2024-12-29,2026=2026-01-04"
-- Back-compat: if FISCAL_ANCHORS not set, uses:
-    FISCAL_WEEK1_START_YMD + FISCAL_YEAR_LABEL (single anchor mode)
+Optional debug:
+- DEBUG_SAMPLE_ROWS=true prints a small sample of Adobe's first returned row for a few requests
 """
 
 import os
 import time
 import json
+import shutil
+import hashlib
 import threading
 import ftplib
 from pathlib import Path
@@ -58,7 +50,7 @@ except ImportError:
 
 # ================== Config (env-driven in GitHub Actions) ==================
 
-# Adobe credentials (MANDATORY via env in GitHub Actions)
+# Adobe credentials (MANDATORY via env)
 AA_CLIENT_ID = os.environ.get("AA_CLIENT_ID", "")
 AA_CLIENT_SECRET = os.environ.get("AA_CLIENT_SECRET", "")
 AA_API_KEY = os.environ.get("AA_API_KEY", AA_CLIENT_ID or "")
@@ -68,13 +60,13 @@ AA_COMPANY_ID = os.environ.get("AA_COMPANY_ID", "")
 AUTH_URL = "https://ims-na1.adobelogin.com/ims/token/v3"
 REPORT_URL = f"https://analytics.adobe.io/api/{AA_COMPANY_ID}/reports" if AA_COMPANY_ID else ""
 
-# RSIDs / brands to run (env override BRAND_RSIDS as comma-separated list)
+# WW only
 DEFAULT_BRAND_RSIDS = [
     "vrs_ospgro1_womanwithin",
 ]
 BRAND_RSIDS = [s.strip() for s in os.environ.get("BRAND_RSIDS", "").split(",") if s.strip()] or DEFAULT_BRAND_RSIDS
 
-# Segment mapping (segment_id -> Channel with '(WW)' suffix to be stripped)
+# WW Segment mapping
 SEGMENTS: Dict[str, str] = {
     "s300006919_67dc72805576732634ebe41d": "Affiliate (WW)",
     "s300006919_67dc732feb5ca74056703434": "Cross Brand (WW)",
@@ -108,11 +100,23 @@ DIMENSION = "variables/geodma"
 PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "2000"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "8"))
 
-# Output
+# Output / Cache
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+
 CACHE_DIR = Path(".aa_cache")
 CACHE_DIR.mkdir(exist_ok=True, parents=True)
+
+# Cache controls
+USE_CACHE = os.environ.get("USE_CACHE", "false").lower() in {"1", "true", "yes"}
+CLEAR_WW_CACHE_ON_START = os.environ.get("CLEAR_WW_CACHE_ON_START", "true").lower() in {"1", "true", "yes"}
+CACHE_NAMESPACE = os.environ.get("CACHE_NAMESPACE", "ww_dma_v2")
+
+# Debug
+DEBUG_SAMPLE_ROWS = os.environ.get("DEBUG_SAMPLE_ROWS", "true").lower() in {"1", "true", "yes"}
+DEBUG_MAX_SAMPLES = int(os.environ.get("DEBUG_MAX_SAMPLES", "10"))
+_debug_sample_count = 0
+_debug_sample_lock = threading.Lock()
 
 # Required output columns in exact order
 OUTPUT_COLUMNS = ["Date", "DMA", "Last_Touch_Channel", "Visits", "Orders", "Demand", "NMA", "NTF"]
@@ -120,19 +124,17 @@ OUTPUT_COLUMNS = ["Date", "DMA", "Last_Touch_Channel", "Visits", "Orders", "Dema
 # OAuth scopes
 OAUTH_SCOPES = "openid,AdobeID,read_organizations,additional_info.projectedProductContext,session"
 
-# -------- FTP config (from env) --------
+# FTP config
 FTP_HOST = os.environ.get("FTP_HOST", "")
 FTP_USER = os.environ.get("FTP_USER", "")
 FTP_PASS = os.environ.get("FTP_PASS", "")
-FTP_DIR = os.environ.get("FTP_DIR", "/")  # remote folder (default root)
-FTP_TLS = os.environ.get("FTP_TLS", "true").lower() in {"1", "true", "yes"}  # try FTPS first
+FTP_DIR = os.environ.get("FTP_DIR", "/")
+FTP_TLS = os.environ.get("FTP_TLS", "true").lower() in {"1", "true", "yes"}
 
 
 # ================== Date / Fiscal helpers ==================
 
 def _week_start_sunday(d: date) -> date:
-    """Return the Sunday that starts the week containing date d (Sun-Sat week)."""
-    # Python weekday: Mon=0..Sun=6
     days_since_sunday = (d.weekday() + 1) % 7
     return d - timedelta(days=days_since_sunday)
 
@@ -143,10 +145,6 @@ def iso_to_date(iso_str: str) -> date:
     return date.fromisoformat(iso_str[:10])
 
 def iter_days(start_d: date, end_d_exclusive: date) -> List[Tuple[str, str, str]]:
-    """
-    Returns list of (day_start_iso, day_end_iso, day_label_YYYY-MM-DD)
-    for each day in [start_d, end_d_exclusive).
-    """
     days: List[Tuple[str, str, str]] = []
     cur = start_d
     while cur < end_d_exclusive:
@@ -156,11 +154,6 @@ def iter_days(start_d: date, end_d_exclusive: date) -> List[Tuple[str, str, str]
     return days
 
 def parse_fiscal_anchors() -> List[Tuple[int, date]]:
-    """
-    Preferred: FISCAL_ANCHORS="2025=2024-12-29,2026=2026-01-04"
-    Back-compat: FISCAL_YEAR_LABEL + FISCAL_WEEK1_START_YMD
-    Returns sorted list of (fiscal_year_label, week1_start_sunday_date).
-    """
     raw = (os.environ.get("FISCAL_ANCHORS") or "").strip()
     anchors: List[Tuple[int, date]] = []
 
@@ -181,7 +174,6 @@ def parse_fiscal_anchors() -> List[Tuple[int, date]]:
                 )
             anchors.append((fy, d))
     else:
-        # Back-compat single anchor mode
         fy = int(os.environ.get("FISCAL_YEAR_LABEL", "2026"))
         d = _parse_ymd(os.environ.get("FISCAL_WEEK1_START_YMD", "2026-01-04"))
         if _week_start_sunday(d) != d:
@@ -197,11 +189,6 @@ def parse_fiscal_anchors() -> List[Tuple[int, date]]:
 FISCAL_ANCHORS_LIST: List[Tuple[int, date]] = parse_fiscal_anchors()
 
 def fiscal_year_and_week_for_week_start(week_start: date) -> Tuple[Optional[int], Optional[int], Optional[date]]:
-    """
-    Determine (fiscal_year, fiscal_week_no, fy_week1_start) for a given week_start Sunday.
-    Uses the most recent anchor whose date <= week_start.
-    If no anchor applies, returns (None, None, None).
-    """
     applicable = [a for a in FISCAL_ANCHORS_LIST if a[1] <= week_start]
     if not applicable:
         return None, None, None
@@ -211,19 +198,12 @@ def fiscal_year_and_week_for_week_start(week_start: date) -> Tuple[Optional[int]
     return fy, week_no, fy_week1
 
 def prior_week_sun_to_sun_iso() -> Tuple[str, str, str, str, Optional[int], Optional[int], Optional[date]]:
-    """
-    Compute *last completed* Sun->Sun (exclusive) window:
-      start = prior week Sunday 00:00:00.000
-      end   = current week Sunday 00:00:00.000 (exclusive)
-    Returns:
-      (start_iso, end_iso, start_ymd, end_ymd, fiscal_year, fiscal_week_no, fy_week1_start)
-    """
     tz = ZoneInfo("America/New_York")
     today = datetime.now(tz).date()
 
-    current_week_start = _week_start_sunday(today)  # Sunday of THIS week
-    start = current_week_start - timedelta(days=7)  # Sunday of LAST completed week
-    end = current_week_start                        # exclusive end (Sunday)
+    current_week_start = _week_start_sunday(today)
+    start = current_week_start - timedelta(days=7)
+    end = current_week_start
 
     fy, wk, fy_week1 = fiscal_year_and_week_for_week_start(start)
 
@@ -249,8 +229,38 @@ else:
 
 START_DATE_D = iso_to_date(START_DATE)
 END_DATE_D_EXCL = iso_to_date(END_DATE)
+DAY_RANGES = iter_days(START_DATE_D, END_DATE_D_EXCL)
 
-DAY_RANGES = iter_days(START_DATE_D, END_DATE_D_EXCL)  # [(day_start_iso, day_end_iso, day_label), ...]
+
+# ================== Cache helpers ==================
+
+def clear_cache_for_rsids(rsids: List[str]) -> None:
+    for rsid in rsids:
+        rsid_dir = CACHE_DIR / CACHE_NAMESPACE / rsid
+        if rsid_dir.exists():
+            shutil.rmtree(rsid_dir, ignore_errors=True)
+            print(f"🧹 Cleared cache: {rsid_dir}")
+
+def payload_signature(rsid: str, segment_id: str, day_start_iso: str, day_end_iso: str, limit: int) -> str:
+    stable_payload = {
+        "rsid": rsid,
+        "segment_id": segment_id,
+        "date_range": f"{day_start_iso}/{day_end_iso}",
+        "dimension": DIMENSION,
+        "metrics": [VISITS_ID, ORDERS_ID, DEMAND_ID, NMA_ID, NTF_ID],
+        "limit": limit,
+        "countRepeatInstances": True,
+        "includeAnnotations": True,
+        "nonesBehavior": "return-nones",
+        "cache_namespace": CACHE_NAMESPACE,
+    }
+    raw = json.dumps(stable_payload, sort_keys=True).encode("utf-8")
+    return hashlib.md5(raw).hexdigest()[:12]
+
+def get_cache_file(rsid: str, segment_id: str, day_label: str, sig: str, page: int) -> Path:
+    seg_day_dir = CACHE_DIR / CACHE_NAMESPACE / rsid / segment_id / day_label / sig
+    seg_day_dir.mkdir(parents=True, exist_ok=True)
+    return seg_day_dir / f"page_{page:05d}.json"
 
 
 # ================== Token Manager (thread-safe) ==================
@@ -349,6 +359,31 @@ def parse_rows_to_df(rows: List[Dict[str, Any]], day_label: str, ch_name: str) -
         })
     return pd.DataFrame(out, columns=OUTPUT_COLUMNS)
 
+def maybe_print_debug_sample(rsid: str, segment_id: str, day_label: str, payload: Dict[str, Any], data: Dict[str, Any]) -> None:
+    global _debug_sample_count
+
+    if not DEBUG_SAMPLE_ROWS:
+        return
+
+    with _debug_sample_lock:
+        if _debug_sample_count >= DEBUG_MAX_SAMPLES:
+            return
+        _debug_sample_count += 1
+
+    rows = data.get("rows", []) or []
+    first_row = rows[0] if rows else None
+
+    print("DEBUG_SAMPLE", json.dumps({
+        "rsid": rsid,
+        "segment_id": segment_id,
+        "day": day_label,
+        "metrics": [m["id"] for m in payload["metricContainer"]["metrics"]],
+        "dimension": payload["dimension"],
+        "totalPages": data.get("totalPages"),
+        "rowCount": len(rows),
+        "firstRow": first_row,
+    }, default=str))
+
 
 # ================== HTTP with retries (threads) ==================
 
@@ -366,12 +401,10 @@ def fetch_page(
     page: int,
     limit: int,
 ) -> Dict[str, Any]:
-    # Cache is day-specific so daily pulls don't collide
-    seg_day_dir = CACHE_DIR / rsid / segment_id / day_label
-    seg_day_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = seg_day_dir / f"page_{page:05d}.json"
+    sig = payload_signature(rsid, segment_id, day_start_iso, day_end_iso, limit)
+    cache_file = get_cache_file(rsid, segment_id, day_label, sig, page)
 
-    if cache_file.exists():
+    if USE_CACHE and cache_file.exists():
         with cache_file.open("r", encoding="utf-8") as f:
             return json.load(f)
 
@@ -388,8 +421,14 @@ def fetch_page(
 
             if status == 200:
                 data = resp.json()
-                with cache_file.open("w", encoding="utf-8") as f:
-                    json.dump(data, f)
+
+                if page == 0:
+                    maybe_print_debug_sample(rsid, segment_id, day_label, payload, data)
+
+                if USE_CACHE:
+                    with cache_file.open("w", encoding="utf-8") as f:
+                        json.dump(data, f)
+
                 return data
 
             if status == 401:
@@ -429,10 +468,6 @@ def fetch_page(
 # ================== FTP upload helper ==================
 
 def upload_to_ftp(local_path: Path, remote_dir: str, host: str, user: str, pwd: str, try_ftps: bool = True, retries: int = 3):
-    """
-    Uploads a file to FTP/FTPS. Tries FTPS first (explicit TLS on port 21), falls back to plain FTP if FTPS fails.
-    Uses passive mode and creates remote_dir if it doesn't exist.
-    """
     def _ensure_dir(ftp, d):
         parts = [p for p in d.split("/") if p]
         for p in parts:
@@ -449,7 +484,7 @@ def upload_to_ftp(local_path: Path, remote_dir: str, host: str, user: str, pwd: 
                 ftp = ftplib.FTP_TLS(timeout=60)
                 ftp.connect(host, 21)
                 ftp.login(user=user, passwd=pwd)
-                ftp.prot_p()  # secure data channel
+                ftp.prot_p()
             else:
                 ftp = ftplib.FTP(timeout=60)
                 ftp.connect(host, 21)
@@ -478,7 +513,7 @@ def upload_to_ftp(local_path: Path, remote_dir: str, host: str, user: str, pwd: 
         except Exception as e:
             last_err = e
             print(f"[FTP attempt {attempt}/{retries}] {type(e).__name__}: {e}")
-            try_ftps = False  # next attempt: plain FTP
+            try_ftps = False
             time.sleep(min(10, 2 * attempt))
     raise RuntimeError(f"FTP upload failed after {retries} attempts: {last_err}")
 
@@ -506,18 +541,12 @@ def fetch_all_pages_for_combo_day(
     day_label: str,
 ) -> pd.DataFrame:
     frames: List[pd.DataFrame] = []
-    seg_day_dir = CACHE_DIR / rsid / segment_id / day_label
-    seg_day_dir.mkdir(parents=True, exist_ok=True)
 
     with requests.Session() as session:
         first, total_pages = get_first_and_total_pages(session, rsid, segment_id, day_label, day_start_iso, day_end_iso)
         frames.append(parse_rows_to_df(first.get("rows", []), day_label, channel_name))
 
-        cached_pages = {
-            int(p.stem.split("_")[-1]) for p in seg_day_dir.glob("page_*.json")
-            if p.stem.split("_")[-1].isdigit()
-        }
-        needed = [p for p in range(1, total_pages) if p not in cached_pages]
+        needed = list(range(1, total_pages))
 
         if needed:
             pbar = tqdm(
@@ -544,8 +573,9 @@ def main():
     problems: List[str] = []
     had_any_sheet = False
 
-    # ---------- Weekly filename pattern with optional FY/WK tag ----------
-    # Inclusive week end is Saturday = exclusive end - 1 day
+    if CLEAR_WW_CACHE_ON_START:
+        clear_cache_for_rsids(BRAND_RSIDS)
+
     week_end_inclusive = (END_DATE_D_EXCL - timedelta(days=1)).strftime("%Y-%m-%d")
 
     fywk = ""
@@ -567,7 +597,6 @@ def main():
                 for seg_id in seg_ids:
                     ch_name = SEGMENTS[seg_id]
 
-                    # Day-level loop (daily rows)
                     day_pbar = tqdm(total=len(DAY_RANGES), desc=f"Days ({clean_channel_name(ch_name)})", leave=False)
                     try:
                         for day_start_iso, day_end_iso, day_label in DAY_RANGES:
@@ -596,7 +625,6 @@ def main():
                     df_brand = pd.concat(frames_for_brand, ignore_index=True)
                     df_brand = df_brand[OUTPUT_COLUMNS]
 
-                    # Stable sort for readability
                     df_brand.sort_values(by=["Date", "Last_Touch_Channel", "DMA"], inplace=True, kind="mergesort")
 
                     sheet_name = rsid[:31]
@@ -610,7 +638,6 @@ def main():
 
             brand_pbar.update(1)
 
-        # Ensure file is valid even if empty
         if not had_any_sheet:
             pd.DataFrame(columns=OUTPUT_COLUMNS).to_excel(writer, sheet_name="Summary", index=False)
             if problems:
@@ -618,8 +645,6 @@ def main():
 
     brand_pbar.close()
 
-    # Write path for the workflow
-    OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
     with open(OUTPUT_DIR / "latest.txt", "w", encoding="utf-8") as f:
         f.write(str(out_path.resolve()))
 
@@ -629,10 +654,12 @@ def main():
         for p in problems:
             print(" -", p)
 
-    print("• Resumable cache: .aa_cache/<rsid>/<segment_id>/<YYYY-MM-DD>/page_XXXXX.json")
     print("• Columns:", ", ".join(OUTPUT_COLUMNS))
     print(f"• Week window (exclusive end in AA): {START_D} to {END_D}")
     print(f"• Filename window (inclusive end): {START_D} to {week_end_inclusive}")
+    print(f"• USE_CACHE={USE_CACHE}")
+    print(f"• CLEAR_WW_CACHE_ON_START={CLEAR_WW_CACHE_ON_START}")
+    print(f"• CACHE_NAMESPACE={CACHE_NAMESPACE}")
 
     if FISCAL_YEAR is not None and FISCAL_WEEK is not None:
         print(f"• Fiscal tag: FY{FISCAL_YEAR} WK{FISCAL_WEEK:02d}")
@@ -642,7 +669,6 @@ def main():
         anchors_str = ", ".join([f"FY{fy}={d}" for fy, d in FISCAL_ANCHORS_LIST])
         print(f"• Fiscal tag: (not labeled — no fiscal anchor applies). Anchors: {anchors_str}")
 
-    # --- FTP upload if env vars are present ---
     if FTP_HOST and FTP_USER and FTP_PASS:
         try:
             upload_to_ftp(out_path, FTP_DIR, FTP_HOST, FTP_USER, FTP_PASS, try_ftps=FTP_TLS, retries=3)
